@@ -1,16 +1,24 @@
 services:
+  # Base de données PostgreSQL
   postgres:
     image: postgres:13-alpine
     restart: always
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: mydatabase
+      POSTGRES_USER: smartretail_user
+      POSTGRES_PASSWORD: smartretail_pass
+      POSTGRES_DB: smartretail
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartretail_user -d smartretail"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
+  # Zookeeper pour Kafka
   zookeeper:
     image: confluentinc/cp-zookeeper:7.0.1
     environment:
@@ -19,6 +27,7 @@ services:
     ports:
       - "2181:2181"
 
+  # Kafka broker
   kafka:
     image: confluentinc/cp-kafka:7.0.1
     depends_on:
@@ -30,27 +39,110 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
 
+  # Générateur de données de référence (s'exécute une fois puis s'arrête)
+  data-initializer:
+    build: 
+      context: ./data-initializer
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: smartretail
+      POSTGRES_USER: smartretail_user
+      POSTGRES_PASSWORD: smartretail_pass
+    restart: "no"  # Ne redémarre pas automatiquement
+
+  # Générateur de transactions en temps réel
+  transaction-generator:
+    build:
+      context: ./transaction-generator
+      dockerfile: Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      data-initializer:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: smartretail
+      POSTGRES_USER: smartretail_user
+      POSTGRES_PASSWORD: smartretail_pass
+    restart: always
+
+  # Application PySpark pour traitement ETL
+  pyspark-processor:
+    build:
+      context: ./pyspark-processor
+      dockerfile: Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      transaction-generator:
+        condition: service_started
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: smartretail
+      POSTGRES_USER: smartretail_user
+      POSTGRES_PASSWORD: smartretail_pass
+    restart: always
+
+  # Prometheus pour collecter les métriques
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+
+  # Grafana pour la visualisation
   grafana:
     image: grafana/grafana:latest
     depends_on:
+      - prometheus
       - postgres
     ports:
       - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin123
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
 
-  python-app:
-    build: ./app
+  # Exporteur de métriques pour PostgreSQL
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
     depends_on:
-      - postgres
-      - kafka
+      postgres:
+        condition: service_healthy
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: mydatabase
-      KAFKA_BROKERS: kafka:9092
+      DATA_SOURCE_NAME: "postgresql://smartretail_user:smartretail_pass@postgres:5432/smartretail?sslmode=disable"
+    ports:
+      - "9187:9187"
 
 volumes:
   postgres-data:
   grafana-data:
+  prometheus-data:
+
+networks:
+  default:
+    driver: bridge

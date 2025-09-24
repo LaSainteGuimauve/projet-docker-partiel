@@ -13,7 +13,7 @@ time.sleep(20) # We need to wait a little longer for Spark to start and connect 
 spark = (
     SparkSession.builder
     .appName("PySpark-Postgres-Kafka-App")
-    .config("spark.jars", "postgresql-42.7.3.jar") # Nom du jar dans le conteneur
+    .config("spark.jars", "/app/postgresql-42.7.3.jar") # Nom du jar dans le conteneur
     .getOrCreate()
 )
 
